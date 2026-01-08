@@ -1,0 +1,163 @@
+# Release agentica-internal to PyPI
+# Triggered when a version tag is pushed
+
+name: Release to PyPI
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run (build and test only, no publish)'
+        type: boolean
+        default: false
+
+jobs:
+  build:
+    name: Build package
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Extract version from tag
+        id: version
+        run: |
+          VERSION="${GITHUB_REF#refs/tags/v}"
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Build package
+        run: |
+          uv build
+          ls -la dist/
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          retention-days: 5
+
+  test-wheel:
+    name: Test built wheel
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Install wheel
+        run: |
+          uv venv test-env
+          source test-env/bin/activate
+          uv pip install dist/*.whl
+          uv pip install pytest pytest-asyncio pytest-timeout
+
+      - name: Test imports
+        run: |
+          source test-env/bin/activate
+          python -c "
+          import agentica_internal
+          print(f'✓ agentica_internal {agentica_internal.__version__}')
+          "
+
+      - name: Run pytest
+        run: |
+          source test-env/bin/activate
+          pytest test/ -v --tb=short -x
+
+  publish-pypi:
+    name: Publish to PyPI
+    if: ${{ !inputs.dry_run && github.ref_type == 'tag' }}
+    needs: [build, test-wheel]
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+
+  verify-pypi:
+    name: Verify PyPI installation
+    if: ${{ !inputs.dry_run && github.ref_type == 'tag' }}
+    needs: [build, publish-pypi]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Wait for PyPI to index
+        run: sleep 60
+
+      - name: Install and verify
+        run: |
+          uv venv verify-env
+          source verify-env/bin/activate
+          uv pip install agentica-internal==${{ needs.build.outputs.version }}
+          python -c "
+          import agentica_internal
+          assert agentica_internal.__version__ == '${{ needs.build.outputs.version }}'
+          print(f'✓ Verified agentica-internal=={agentica_internal.__version__} from PyPI')
+          "
+
+  create-release:
+    name: Create GitHub Release
+    if: ${{ !inputs.dry_run && github.ref_type == 'tag' }}
+    needs: [build, publish-pypi, verify-pypi]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: v${{ needs.build.outputs.version }}
+          body: |
+            ## agentica-internal v${{ needs.build.outputs.version }}
+
+            ```bash
+            pip install agentica-internal==${{ needs.build.outputs.version }}
+            ```
+          files: dist/*
+          generate_release_notes: true
